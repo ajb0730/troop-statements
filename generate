@@ -1,0 +1,256 @@
+#!/usr/bin/env node
+// vim: ai:sts=2:ts=2:et
+
+const https = require('https')
+const fs = require('fs')
+const { parse } = require('csv-parse')
+const Decimal = require('decimal')
+const today = new Date()
+
+function findDate (input, backupDate) {
+  const months = {
+    Jan: 0,
+    January: 0,
+    Feb: 1,
+    February: 1,
+    Mar: 2,
+    March: 2,
+    Apr: 3,
+    April: 3,
+    May: 4,
+    Jun: 5,
+    June: 5,
+    Jul: 6,
+    July: 6,
+    Aug: 7,
+    August: 7,
+    Sep: 8,
+    September: 8,
+    Oct: 9,
+    October: 9,
+    Nov: 10,
+    November: 10,
+    Dec: 11,
+    December: 11
+  }
+  const dateRegex = /^(Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|September|Oct|October|Nov|November|Dec|December) (20[1-9][0-9])/
+
+  if (dateRegex.test(input)) {
+    const match = input.match(dateRegex)
+    const date = new Date(match[2], months[match[1]], 1)
+    return date
+  }
+
+  const monthRegex = /^(Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|September|Oct|October|Nov|November|Dec|December)/
+  if (monthRegex.test(input)) {
+    const match = input.match(monthRegex)
+    const year = backupDate.getMonth() >= months[match[1]]
+      ? backupDate.getYear() + 1
+      : backupDate.getYear()
+    const date = new Date(year, months[match[1]], 1)
+    return date
+  }
+
+  return null
+}
+
+function generateInvoice (invoice, filename, success, error) {
+  const postData = JSON.stringify(invoice)
+  const options = {
+    hostname: 'invoice-generator.com',
+    port: 443,
+    path: '/',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(postData)
+    }
+  }
+
+  const file = fs.createWriteStream(filename)
+
+  const req = https.request(options, function (res) {
+    res.on('data', function (chunk) {
+      file.write(chunk)
+    })
+      .on('end', function () {
+        file.end()
+
+        if (typeof success === 'function') {
+          success()
+        }
+      })
+  })
+  req.write(postData)
+  req.end()
+
+  if (typeof error === 'function') {
+    req.on('error', error)
+  }
+}
+
+function processRecords (records, filter) {
+  const recordsByName = {}
+  for (const record of records) {
+    if (!recordsByName[record.Name]) {
+      recordsByName[record.Name] = []
+    }
+    recordsByName[record.Name].push(record)
+  }
+  if (filter) {
+    processIndividual(filter, recordsByName[filter])
+  } else {
+    for (const name of Object.keys(recordsByName)) {
+      processIndividual(name, recordsByName[name])
+    }
+  }
+}
+
+/*
+see:
+  https://invoice-generator.com/developers
+
+example:
+  var invoice = {
+      logo: "http://invoiced.com/img/logo-invoice.png",
+      from: "Invoiced\n701 Brazos St\nAustin, TX 78748",
+      to: "Johnny Appleseed",
+      currency: "usd",
+      number: "INV-0001",
+      payment_terms: "Auto-Billed - Do Not Pay",
+      items: [
+          {
+              name: "Subscription to Starter",
+              quantity: 1,
+              unit_cost: 50
+          }
+      ],
+      fields: {
+          tax: "%"
+      },
+      tax: 5,
+      notes: "Thanks for being an awesome customer!",
+      terms: "No need to submit payment. You will be auto-billed for this invoice."
+  };
+*/
+function processIndividual (name, records) {
+  const invoice = {
+    header: 'STATEMENT',
+    to_title: 'Scout',
+    logo: 'https://scontent-lga3-2.xx.fbcdn.net/v/t1.6435-1/84839009_942642876132862_2415839011449864192_n.jpg?stp=dst-jpg_p148x148&_nc_cat=103&ccb=1-7&_nc_sid=1eb0c7&_nc_ohc=j-rpeRK4teMAX-_tAX4&_nc_ht=scontent-lga3-2.xx&oh=00_AT_bwQaL_KbPGi4ZOPLBrH1Lc2hTC16SV_6kWDmmpnSctg&oe=633B1D07',
+    from: 'ScoutsBSA Troop 201\nwww.JenkintownTroop201.org',
+    to: name,
+    currency: 'usd',
+    fields: {
+      tax: false,
+      discounts: false,
+      shipping: false
+    },
+    items: []
+  }
+
+  // console.log('unsorted',records)
+  records.sort((a, b) => {
+    const dateCompare = a.Date - b.Date
+    if (dateCompare === 0) {
+      const foundDateA = findDate(a.Description, a.Date)
+      const foundDateB = findDate(b.Description, a.Date)
+      if (foundDateA && foundDateB) {
+        return foundDateA - foundDateB
+      } else {
+        return a.Description.localeCompare(b.Description)
+      }
+    }
+    return dateCompare
+  })
+  // console.log('sorted',records)
+
+  for (const record of records) {
+    if (record['Apply To Payment Log ID']) {
+      for (const target of records) {
+        if (target['Payment Log ID'] === record['Apply To Payment Log ID']) {
+          const original = Decimal(target.Net)
+          const payment = Decimal(record.Net)
+          if (Math.abs(original.toNumber()) >= Math.abs(payment.toNumber())) {
+            target.Net = target.Net.add(record.Net)
+            record.Net = Decimal(0)
+          } else {
+            record.Net = record.Net.add(target.Net)
+            target.Net = Decimal(0)
+          }
+          target['Transaction ID'] += `$${Math.abs(original.toNumber()).toFixed(2)} charge less $${Math.abs(payment.toNumber()).toFixed(2)} payment on ${record.Date.toLocaleDateString()}; `
+          // console.log('target',target)
+          // console.log('record',record)
+        }
+      }
+      // console.log('source',record)
+    }
+  }
+
+  let balance = Decimal(0)
+  for (const record of records) {
+    const foundDate = findDate(record.Description, record.Date)
+    if (record.Net.toNumber() !== 0 && record.Date <= today && (foundDate == null || foundDate <= today)) {
+      balance = balance.add(record.Net)
+      if (balance.toNumber() === 0) {
+        invoice.items = []
+      } else {
+        invoice.items.push({
+          name: record.Description,
+          quantity: 1,
+          unit_cost: record.Net.toNumber().toFixed(2),
+          description: `${record.Date.toLocaleDateString()}: ${record['Transaction ID']}Balance: $${balance.toNumber().toFixed(2)}`
+        })
+      }
+    }
+  }
+
+  console.log('balance', balance.toNumber())
+  if (Math.abs(balance.toNumber()) > 0.01) {
+    // console.log(name, invoice)
+    if (balance.toNumber() < 0) {
+      invoice.balance_title = 'Troop Credit'
+    } else {
+      invoice.balance_title = 'Owed to Troop'
+    }
+    generateInvoice(invoice, `${name}.pdf`)
+  }
+}
+
+// "SB User ID","BSA Member ID","First Name","Last Name","NickName","Payment Log ID","Payment Type","Date","Description","Amount","Transaction ID","Apply To Payment Log ID","Category","Notes"
+/// /////////////////////////////////////////////////////////////////////////////
+
+const { argv } = process
+if (argv.length < 3 || !fs.existsSync(argv[2])) {
+  console.error('')
+  console.error('USAGE: generate path/to/payment_logs.csv')
+  console.error('')
+  process.exit(1)
+}
+
+const fileName = argv[2]
+const filter = argv[3] || ''
+const parser = parse({ columns: true })
+const records = []
+parser.on('readable', () => {
+  let record
+  while ((record = parser.read()) !== null) {
+    const date = record.Date.split('/')
+    record.Date = new Date(date[2], date[0] - 1, date[1])
+    record.Name = `${record['First Name']} ${record['Last Name']}`
+    record.Amount = Decimal(-1.0 * parseFloat(record.Amount))
+    record.Net = Decimal(record.Amount)
+    if (record['Transaction ID']) {
+      record['Transaction ID'] += '; '
+    }
+    records.push(record)
+  }
+})
+parser.on('error', (err) => {
+  console.error(err.message)
+})
+parser.on('end', () => {
+  processRecords(records, filter)
+})
+const input = fs.createReadStream(fileName)
+input.pipe(parser)
